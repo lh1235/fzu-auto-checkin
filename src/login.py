@@ -14,6 +14,8 @@
 """
 import base64
 import re
+from html import unescape
+from urllib.parse import urlsplit
 
 import requests
 from Crypto.Cipher import AES
@@ -28,6 +30,39 @@ UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
 )
+
+
+_VERIFICATION_TEXT = re.compile(
+    r"请输入\s*(?:图形|图片|短信|邮件)?\s*验证码"
+    r"|(?:请|需要)(?:先)?\s*(?:完成|通过|进行)\s*(?:安全|人机|身份)?验证"
+    r"|验证码\s*(?:错误|无效|已过期)"
+    r"|\b(?:verify (?:that )?you are (?:a )?human|captcha required"
+    r"|enter (?:the )?(?:captcha|verification code)|security verification)\b",
+    re.IGNORECASE,
+)
+
+
+def _response_summary(response: requests.Response) -> str:
+    """生成可写入 Actions 日志的登录诊断，省略地址路径、参数和响应正文。"""
+    try:
+        hostname = urlsplit(response.url or "").hostname
+    except ValueError:
+        hostname = None
+    if not hostname or not re.fullmatch(r"[a-zA-Z0-9.-]{1,253}", hostname):
+        hostname = "未知"
+
+    html = re.sub(
+        r"<(script|style|template|noscript)\b[^>]*>.*?</\1\s*>",
+        " ",
+        response.text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    page_text = unescape(re.sub(r"<[^>]*>", "", html))
+    verification = "疑似有" if _VERIFICATION_TEXT.search(page_text) else "未检测到"
+    return (
+        f"HTTP 状态码={response.status_code}，最终域名={hostname}，"
+        f"验证提示={verification}"
+    )
 
 
 def _parse_field(html: str, elem_id: str) -> str:
@@ -56,9 +91,13 @@ def login(username: str, password: str) -> str:
 
     # 1. 拿登录页（croypto + execution）
     r = s.get(SSO_BASE, params={"service": SERVICE}, timeout=15)
-    r.raise_for_status()
-    croypto = _parse_field(r.text, "login-croypto")
-    execution = _parse_field(r.text, "login-page-flowkey")
+    if r.status_code >= 400:
+        raise requests.HTTPError(f"SSO 登录页请求失败；{_response_summary(r)}", response=r)
+    try:
+        croypto = _parse_field(r.text, "login-croypto")
+        execution = _parse_field(r.text, "login-page-flowkey")
+    except RuntimeError as exc:
+        raise RuntimeError(f"{exc}；{_response_summary(r)}") from None
 
     # 2. 加密密码并提交表单
     data = {
@@ -84,7 +123,4 @@ def login(username: str, password: str) -> str:
         if token:
             return token
 
-    # 失败：尝试从返回页面提取错误信息
-    err = re.search(r'id="login-error-msg"[^>]*>([^<]+)', r2.text)
-    hint = err.group(1).strip() if err else "未知错误（可能需要验证码或页面结构变化）"
-    raise RuntimeError(f"SSO 登录失败: {hint}")
+    raise RuntimeError(f"SSO 登录失败：未取得登录凭据；{_response_summary(r2)}")
